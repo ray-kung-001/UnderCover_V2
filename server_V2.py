@@ -1,5 +1,6 @@
-# server_V2.py — 多臥底版（自動投票 / 搶話提示 / 平票重講 / 起始UC= floor(n/2)-1 / 投票明細）
-# + 新增：粗體輪到的人、Host 點玩家可踢出（含確認）、可選擇每人發言20秒倒數
+# server_V2.py — 多臥底版（自動投票 / 搶話提示 / 平票重講 / 起始UC= floor(n/2)-1 / 投票明細
+# + 粗體輪到的人 / Host可踢人 / 可選每人發言20秒倒數
+# + NEW: 每局結束彈窗揭示身份與字詞（10秒，玩家名稱粗體）、開始遊戲時顯示本局臥底人數
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.responses import HTMLResponse
 import uvicorn, json, random, uuid, math, asyncio
@@ -35,8 +36,8 @@ WORD_PAIRS = [
 #   "speak_order": [cid,...],
 #   "speak_index": int,
 #   "spoken_this_turn": set[cid],
-#   "limit_20s": bool,           # 是否限制每人發言20秒
-#   "speak_token": str|None,     # 每次指派/換人生成新token，用來作廢舊倒數
+#   "limit_20s": bool,
+#   "speak_token": str|None,
 #   "timer_task": asyncio.Task|None
 # }
 rooms = {}
@@ -116,22 +117,20 @@ async def ws_endpoint(ws: WebSocket):
             if t == "kick":
                 room = find_room(cid)
                 if not room: continue
-                if rooms[room]["host"] != cid:  # 僅 Host 可踢
+                if rooms[room]["host"] != cid:
                     continue
                 target = msg.get("target")
                 if not target or target not in rooms[room]["clients"]:
                     continue
-                # 通知被踢者
                 try:
                     await rooms[room]["clients"][target]["ws"].send_text(json.dumps({"type":"kicked"}))
                     await rooms[room]["clients"][target]["ws"].close()
                 except:
                     pass
-                # 移除
                 rooms[room]["clients"].pop(target, None)
                 await syslog(room, "已將一名玩家移出房間。")
                 await broadcast_room_list(room)
-                # 若正在輪流且踢掉的是當前發言者，直接換下一位
+                # 若踢掉當前發言者，補播提示 & 重置20秒
                 if rooms[room]["status"] == "playing" and rooms[room]["speak_order"]:
                     order = rooms[room]["speak_order"]
                     if target in order:
@@ -139,12 +138,11 @@ async def ws_endpoint(ws: WebSocket):
                         rooms[room]["speak_order"] = order
                         if order:
                             if rooms[room]["speak_index"] >= len(order):
-                                rooms[room]["speak_index"] = rooms[room]["speak_index"] % len(order)
-                            # 重新提示當前該誰發言（含粗體）
+                                rooms[room]["speak_index"] %= len(order)
                             cur = order[rooms[room]["speak_index"]]
                             cur_name = rooms[room]["clients"][cur]["name"]
                             await syslog(room, f"現在輪到 <b>{cur_name}</b> 發言。", session=rooms[room]["session"])
-                            await restart_speaker_timer(room)  # 重置20秒
+                            await restart_speaker_timer(room)
                 continue
 
             # 開始遊戲（Host）
@@ -173,7 +171,7 @@ async def ws_endpoint(ws: WebSocket):
                 await broadcast(room, {"type":"chat_session","session": rooms[room]["session"]})
                 await broadcast(room, {"type":"sys_session","session": rooms[room]["session"]})
 
-                # 抽題
+                # 抽題（避免連續重複）
                 pool = list(rooms[room]["word_pool"])
                 last = rooms[room]["last_pair"]
                 if last and len(pool) > 1:
@@ -186,7 +184,7 @@ async def ws_endpoint(ws: WebSocket):
                 n = len(players)
                 uc_target = max(1, min(math.floor(n/2) - 1, n-1))
 
-                # 指派臥底
+                # 指派臥底 & 派字
                 rooms[room]["undercover_ids"] = set(random.sample(players, uc_target))
                 for pcid in players:
                     role = "undercover" if pcid in rooms[room]["undercover_ids"] else "civilian"
@@ -195,6 +193,9 @@ async def ws_endpoint(ws: WebSocket):
                     await rooms[room]["clients"][pcid]["ws"].send_text(json.dumps({
                         "type":"you_are","word":word,"alive":True,"role":role
                     }))
+
+                # 公佈本局臥底人數（依你新需求）
+                await syslog(room, f"本局臥底人數：<b>{uc_target}</b> 人。", session=rooms[room]["session"])
 
                 # 本回合發言順序（每人一次；都講完自動投票）
                 await start_new_turn(room)
@@ -251,7 +252,7 @@ async def ws_endpoint(ws: WebSocket):
                         rooms[room]["status"] = "playing"
                         rooms[room]["votes"] = {}
                         rooms[room]["spoken_this_turn"] = set()
-                        await start_new_turn(room)  # 重新安排順序
+                        await start_new_turn(room)
                         await broadcast_room_list(room)
                     else:
                         # 淘汰最高票
@@ -272,6 +273,8 @@ async def ws_endpoint(ws: WebSocket):
                             await syslog(room,
                                 f"遊戲結束：平民勝利！本局詞語：平民「{rooms[room]['pair'][0]}」 / 臥底「{rooms[room]['pair'][1]}」。",
                                 session=rooms[room]["session"])
+                            # NEW: 結束彈窗揭露全部身份與詞
+                            await reveal_all(room)
                             await broadcast(room, {"type":"gameover","winner":"平民"})
                         elif len(uc_alive) >= len(civ_alive):
                             rooms[room]["status"] = "ended"
@@ -279,6 +282,8 @@ async def ws_endpoint(ws: WebSocket):
                             await syslog(room,
                                 f"遊戲結束：臥底勝利！本局詞語：平民「{rooms[room]['pair'][0]}」 / 臥底「{rooms[room]['pair'][1]}」。",
                                 session=rooms[room]["session"])
+                            # NEW: 結束彈窗揭露全部身份與詞
+                            await reveal_all(room)
                             await broadcast(room, {"type":"gameover","winner":"臥底"})
                         else:
                             # 下一回合
@@ -326,7 +331,7 @@ async def ws_endpoint(ws: WebSocket):
                 await broadcast_room_list(room)
                 continue
 
-            # 發言（輪流；每人每回合最多一次；都講完自動投票）
+            # 發言
             if t == "say":
                 room = find_room(cid)
                 if not room: continue
@@ -431,9 +436,7 @@ def remove_client(cid: str):
     if not rid: return
     room = rooms[rid]
     room["clients"].pop(cid, None)
-    # 若房間清空就刪掉
     if not room["clients"]:
-        # 確保定時器取消
         try:
             if room.get("timer_task"):
                 room["timer_task"].cancel()
@@ -466,17 +469,15 @@ async def open_vote(room_id: str):
     await broadcast(room_id, {"type":"voting_open","alive":alive_list})
 
 async def advance_after_speak(room_id: str, who_cid: str):
-    """當一位玩家成功發言後，切到下一位；若所有存活者皆在 spoken_this_turn 中，則自動投票"""
     r = rooms[room_id]
     if r["status"] != "playing":
         return
     alive_set = set([x for x,info in r["clients"].items() if info["alive"]])
-    # 是否全員講過
+    # 全員講過？
     if alive_set.issubset(r["spoken_this_turn"]):
         await open_vote(room_id)
         return
-
-    # 切到下一位（找下一個未發言且存活）
+    # 找下一位未發言者
     order = [x for x in r["speak_order"] if x in alive_set]
     if not order:
         await open_vote(room_id)
@@ -500,7 +501,6 @@ async def advance_after_speak(room_id: str, who_cid: str):
     await restart_speaker_timer(room_id)
 
 async def restart_speaker_timer(room_id: str):
-    """若開啟 20 秒限制：啟動/重啟倒數；到時未發言 → 自動換下一位（並把該位視為已完成發言）"""
     r = rooms[room_id]
     await cancel_timer(room_id)
     if not r.get("limit_20s"):
@@ -517,11 +517,9 @@ async def restart_speaker_timer(room_id: str):
     async def timer():
         try:
             await asyncio.sleep(20)
-            # 確認 token 仍有效、仍在 playing、仍輪到同一人
             rr = rooms.get(room_id)
             if not rr or rr["status"] != "playing": return
             if rr.get("speak_token") != token: return
-            # 把該位視為「已完成發言」（超時略過內容）
             rr["spoken_this_turn"].add(current)
             name = rr["clients"][current]["name"]
             await syslog(room_id, f"{name} 超過 20 秒未發言，換下一位。", session=rr["session"])
@@ -546,7 +544,32 @@ async def cancel_timer(room_id: str):
             pass
     r["timer_task"] = None
 
-# ===== 前端（加：Host 踢人選單、建房可勾選20秒限制、粗體輪到的人） =====
+async def reveal_all(room_id: str):
+    """NEW: 廣播全體玩家身份與詞語，用於前端彈窗顯示 10 秒"""
+    r = rooms.get(room_id)
+    if not r: return
+    pair = r["pair"]
+    uc_ids = set(r["undercover_ids"])
+    uc_count = len(uc_ids)
+    detail = []
+    for pcid, info in r["clients"].items():
+        role = "undercover" if pcid in uc_ids else "civilian"
+        word = pair[1] if role == "undercover" else pair[0]
+        detail.append({
+            "name": info["name"],
+            "role": role,
+            "word": word
+        })
+    payload = {
+        "type": "reveal",
+        "uc_count": uc_count,
+        "civil_word": pair[0],
+        "uc_word": pair[1],
+        "players": detail
+    }
+    await broadcast(room_id, payload)
+
+# ===== 前端（新增結束彈窗 reveal、開始時顯示臥底人數） =====
 HTML = """
 <!doctype html>
 <html>
@@ -574,7 +597,7 @@ HTML = """
   .s2{background:#ecfdf5;border:1px solid #bbf7d0}
   .s3{background:#fff7ed;border:1px solid #fed7aa}
   /* 3 秒提示 */
-  #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111827;color:#fff;padding:10px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:.2s}
+  #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111827;color:#fff;padding:10px 14px;border-radius:10px;opacity:0;pointer-events:none;transition:.2s;z-index:90}
   #toast.show{opacity:0.95}
 
   /* Host 專用玩家選單 */
@@ -582,11 +605,28 @@ HTML = """
   #playerMenu button{display:block;width:160px;text-align:left;background:#fff;color:#111827;border:0;border-bottom:1px solid #eef2f7;padding:8px 10px}
   #playerMenu button:last-child{border-bottom:0}
   #playerMenu button:hover{background:#f1f5f9}
+
+  /* NEW: 結束彈窗 */
+  #modalMask{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:100}
+  #modal{background:#fff;border-radius:14px;max-width:600px;width:92%;padding:18px;border:1px solid #e5e7eb;box-shadow:0 20px 40px rgba(0,0,0,.15)}
+  #modal h3{margin:0 0 10px}
+  #modal .sub{color:#64748b;margin-bottom:10px}
+  #modal .row{padding:6px 0;border-bottom:1px dashed #e5e7eb}
+  #modal .row:last-child{border-bottom:0}
 </style>
 </head>
 <body>
 <div id="app">
   <div id="toast"></div>
+
+  <!-- NEW: 結束彈窗 -->
+  <div id="modalMask">
+    <div id="modal">
+      <h3>本局結果</h3>
+      <div class="sub" id="modalDesc"></div>
+      <div id="modalBody"></div>
+    </div>
+  </div>
 
   <div class="card" id="screen-entry">
     <h2>誰是臥底 · 多臥底版</h2>
@@ -650,7 +690,7 @@ HTML = """
       </div>
       <div class="box card">
         <div class="muted">系統訊息（依局分區）</div>
-        <div id="syslog" class="log"></div>
+    <div id="syslog" class="log"></div>
       </div>
     </div>
 
@@ -688,6 +728,24 @@ window.onload = function(){
     t.classList.add("show");
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(()=>{ t.classList.remove("show"); }, ms);
+  }
+
+  // NEW: 結束彈窗（顯示 10 秒）
+  let modalTimer=null;
+  function showModal(descHtml, rows){
+    el("modalDesc").innerHTML = descHtml;
+    const body = el("modalBody");
+    body.innerHTML = "";
+    rows.forEach(r=>{
+      const div = document.createElement("div");
+      div.className="row";
+      // 名稱粗體
+      div.innerHTML = `<b>${r.name}</b> — ${r.role==="undercover"?"臥底":"平民"}｜詞：${r.word}`;
+      body.appendChild(div);
+    });
+    el("modalMask").style.display="flex";
+    if(modalTimer) clearTimeout(modalTimer);
+    modalTimer = setTimeout(()=>{ el("modalMask").style.display="none"; }, 10000);
   }
 
   // 入口
@@ -746,7 +804,7 @@ window.onload = function(){
     if(target){ ws.send(JSON.stringify({type:"vote", target})); el("voteInfo").textContent="已送出投票"; }
   };
 
-  // ---- Host 玩家選單（踢出） ----
+  // Host 玩家選單（踢出）
   const menu = el("playerMenu");
   el("btnMenuClose").onclick = ()=>hideMenu();
   el("btnKick").onclick = ()=>{
@@ -764,7 +822,7 @@ window.onload = function(){
     if(menuVisible && !menu.contains(e.target)) hideMenu();
   });
 
-  // ---- 每局分區：玩家 & 系統 ----
+  // 每局分區：玩家 & 系統
   function ensureSection(rootId, session, title){
     const root = el(rootId);
     let sec = root.querySelector('[data-session="'+session+'"]');
@@ -811,8 +869,6 @@ window.onload = function(){
     if(m.type==="room"){
       el("lblStatus") && (el("lblStatus").textContent = m.status);
       el("lblRound") && (el("lblRound").textContent = m.round);
-
-      // 玩家清單（Host 可點名字出選單）
       const box = el("players");
       box.innerHTML = "";
       (m.players || []).forEach(p=>{
@@ -823,9 +879,9 @@ window.onload = function(){
         if(isHost){
           span.onclick = (e)=>{
             const rect = box.getBoundingClientRect();
-            const x = e.clientX - rect.left;   // 相對 players 盒子的座標
+            const x = e.clientX - rect.left;
             const y = e.clientY - rect.top;
-            if(p.is_host) return;              // 不踢自己
+            if(p.is_host) return;
             showMenu(x, y, p.cid);
           };
         }
@@ -899,6 +955,15 @@ window.onload = function(){
     if(m.type==="round_result"){
       setVoteVisible(false);
       addSys("本輪淘汰：<b>"+m.eliminated+"</b>", currentSession || null);
+    }
+
+    // NEW: 結束彈窗 — 接收伺服器的 reveal
+    if(m.type==="reveal"){
+      // 描述：顯示臥底數、平民詞/臥底詞
+      const desc = `本局臥底人數：<b>${m.uc_count}</b> 人｜平民詞：<b>${m.civil_word}</b>｜臥底詞：<b>${m.uc_word}</b>`;
+      // 依序列出所有玩家（名稱粗體、角色、詞）
+      const rows = (m.players || []).map(p=>({name:p.name, role:p.role, word:p.word}));
+      showModal(desc, rows);
     }
 
     if(m.type==="gameover"){
